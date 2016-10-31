@@ -1,20 +1,8 @@
 from six import iteritems
 import os
+from collections import defaultdict
 
 import pyxmltodict
-
-NAMESPACES = {
-	"http://www.vmware.com/schema/ovf": "vmw",
-	"http://www.vmware.com/vcloud/extension/v1.5": "vmext",
-	"http://www.vmware.com/vcloud/v1.5": "vcloud",
-	"http://www.vmware.com/vcloud/versions": "versions",
-	"http://www.vmware.com/schema/ovfenv": "ve",
-	"http://schemas.dmtf.org/ovf/envelope/1": "ovf",
-	"http://schemas.dmtf.org/ovf/environment/1": "ovfenv",
-	"http://schemas.dmtf.org/wbem/wscim/1/common": "cim",
-	"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData": "rasd",
-	"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData": "vssd",
-}
 
 MEMBER_REDIRECT = {
 	"type": "type_",
@@ -48,37 +36,21 @@ TYPE_REDIRECT = {
 	"anyAttribute": "dict",
 }
 
-def parse_path(path):
-	namespaces 	= {}
+def convert_path(src, dst, ns_map):
+	types = parse_path(src, ns_map)
+	_write_mappings_condensed(types, dst)
+
+def parse_path(path, ns_map):
+	namespaces 	= defaultdict(dict)
 	members 	= {}
 	fs, ds, xfs, xds = _get_files(path, exts="xsd")
 	for f in sorted(fs):
 		subdata = pyxmltodict.parse_path(f)
-		data, namespace, members = _parse_xsd(subdata, namespaces, members)
-		namespace = NAMESPACES[namespace]
-		if namespace not in namespaces:
-			namespaces[namespace] = {}
+		data, namespace, members = _parse_xsd(subdata, namespaces, members, ns_map)
+		namespace = ns_map[namespace]
 		namespaces[namespace].update(data)
 	return namespaces
-
-def convert_path(src, dst):
-	types = parse_path(src)
-
-	ns_dst_template = "{base}/{{namespace}}".format(base=dst)
-	total = 0
-	for namespace, subtypes in iteritems(types):
-		total += len(subtypes)
-		for type_name in subtypes:
-			print "writing: {namespace}:{type_name}".format(namespace=namespace, type_name=type_name)
-			ns_dst = ns_dst_template.format(namespace=namespace)
-			if not os.path.exists(ns_dst):
-				os.makedirs(ns_dst)
-				with open("{dst}/__init__.py".format(dst=ns_dst), "w+") as fd:
-					pass
-	_write_mappings_condensed(types, dst)
-
-	print "Wrote {num} files".format(num=total)
-
+	
 def _write_mappings(types, dst):
 	with open("{dst}/mapping.py".format(dst=dst), "w+") as fd:
 		fd.write("MAPPINGS = {\n")
@@ -142,7 +114,7 @@ def _write_mappings_condensed(types, dst):
 		fd.write("\t}\n")
 		fd.write("}\n")
 
-def _parse_xsd(data, namespaces, members):
+def _parse_xsd(data, namespaces, members, ns_map):
 	types 		= {}
 	defer		= []
 	schema		= data.get("schema", {})
@@ -156,13 +128,13 @@ def _parse_xsd(data, namespaces, members):
 	if not isinstance(simple_types, list):
 		simple_types = [simple_types]
 	for s in simple_types:
-		types[s.get("name")] = _get_data_from_simple_type(s, namespace, namespaces, types, members, defer)
+		types[s.get("name")] = _get_data_from_simple_type(s, namespace, namespaces, ns_map, types, members, defer)
 
 	complex_types = schema.get("complexType", [])
 	if not isinstance(complex_types, list):
 		complex_types = [complex_types]
 	for c in complex_types:
-		complex_type = _get_data_from_complex_type(c, namespace, namespaces, types, members, defer)
+		complex_type = _get_data_from_complex_type(c, namespace, namespaces, ns_map, types, members, defer)
 		if complex_type:
 			types[c.get("name")] = complex_type
 
@@ -171,7 +143,7 @@ def _parse_xsd(data, namespaces, members):
 		failed = []
 		while diff > 0:
 			for c in defer:
-				complex_type = _get_data_from_complex_type(c, namespace, namespaces, types, members, failed)
+				complex_type = _get_data_from_complex_type(c, namespace, namespaces, ns_map, types, members, failed)
 				if complex_type:
 					types[c.get("name")] = complex_type
 			diff 	= len(defer) - len(failed)
@@ -184,6 +156,232 @@ def _parse_xsd(data, namespaces, members):
 				print "   ", f.get("name", f.get("ref"))
 
 	return types, namespace, members
+
+def _get_data_from_simple_type(s, namespace, namespaces, ns_map, types, schema_members, defer):
+	name = s.get("name")
+	print "Processing {namespace}:{name}".format(namespace=ns_map.get(namespace), name=name)
+	subdata = {
+		"name": name,
+		"namespace": namespace,
+		"content_type": "",
+		"parent": s.get("restriction", {}).get("base"),
+		"abstract": s.get("abstract", False),
+		"members": []
+	}
+	return subdata
+
+def _get_data_from_complex_type(c, namespace, namespaces, ns_map, types, schema_members, defer):
+	name = c.get("name")
+	print "Processing {namespace}:{name}".format(namespace=ns_map.get(namespace), name=name)
+	members = []
+
+	elements, attributes, complex_parent = _get_from_extension(c, "complexContent")
+	members += elements+attributes
+
+	elements, attributes, complex_parent_2 = _get_from_content(c, "complexContent")
+	members += elements+attributes
+
+	elements, attributes, simple_parent = _get_from_extension(c, "simpleContent")
+	members += elements+attributes
+
+	elements, attributes, simple_parent_2 = _get_from_content(c, "simpleContent")
+	members += elements+attributes
+
+	elements, attributes, simple_parent_3 = _get_from_type(c)
+	members += elements+attributes
+
+	parent = "BaseSchemaType"
+	if complex_parent_2:
+		complex_parent = complex_parent_2
+
+	if simple_parent_3:
+		simple_parent = simple_parent_3
+	elif simple_parent_2:
+		simple_parent = simple_parent_2
+
+	if complex_parent == simple_parent:
+		parent = complex_parent
+	elif complex_parent == "BaseSchemaType":
+		parent = simple_parent
+	elif simple_parent == "BaseSchemaType":
+		parent = complex_parent
+
+	member_data = []
+	for m in members:
+		ref = m.get("ref")
+		datum = None
+		if m.get("name"):
+			datum = _create_from_name(m, name, namespace, namespaces, ns_map, types, schema_members, defer)
+		elif ref:
+			datum = _create_from_reference(m, ref, name, namespace, namespaces, ns_map, types, schema_members, defer)
+
+		if not datum:
+			defer.append(c)
+			return
+		member_data.append(datum)
+
+	appinfo = c.get("annotation", {}).get("appinfo", {})
+	if not isinstance(appinfo, list):
+		appinfo = [appinfo]
+	content_type = ""
+	for a in appinfo:
+		content_type = a.get("content-type")
+	subdata = {
+		"name": name,
+		"namespace": namespace,
+		"content_type": content_type,
+		"parent": parent,
+		"abstract": c.get("abstract", False),
+		"members": member_data
+	}
+	return subdata
+
+def _create_from_name(m, type_name, namespace, namespaces, ns_map, types, schema_members, defer):
+	sub_complex_type = None
+	complex_type = m.get("complexType")
+	if complex_type:
+		base = replace_end(replace_end(type_name, "_Type", ""), "Type", "")
+		complex_type["name"] = "{base}{name}Type".format(base=base, name=m.get("name"))
+		sub_complex_type = _get_data_from_complex_type(complex_type, namespace, namespaces, types, schema_members, defer)
+		if sub_complex_type:
+			# print "   ", "creating subtype for", complex_type.get("name")
+			types[complex_type.get("name")] = sub_complex_type
+
+	return (
+		MEMBER_REDIRECT.get(m.get("name"), m.get("name")),  						# Modified name
+		ns_map.get(namespace, namespace),  											# Namespace
+		sub_complex_type.get("name") if sub_complex_type else m.get("type"),  		# Type
+		m.get("minOccurs", "0") != "0" or m.get("required") is not None,  			# Required or not
+		m.get("maxOccurs", "1") != "1")  											# List or not
+
+def _create_from_reference(m, ref, type_name, namespace, namespaces, ns_map, types, schema_members, defer):
+	ref_name 	= ref
+	ref_ns 		= namespace
+	if ":" in ref_name:
+		ref_ns		= ref_name.split(":")[0]
+		ref_name 	= ref_name.split(":")[1]
+
+	type_name_1 = type_name_2 = ref_name
+	if not ref_name.endswith("Type"):
+		type_name_1 = "{name}Type".format(name=ref_name)
+		type_name_2	= "{name}_Type".format(name=ref_name)
+
+	type_ = None
+	if ref_ns != namespace:
+		type_ = namespaces.get(ref_ns, {}).get(type_name_1, namespaces.get(ref_ns, {}).get(type_name_2))
+	else:
+		type_ = types.get(type_name_1, types.get(type_name_2))
+
+	if type_:
+		return (
+			MEMBER_REDIRECT.get(ref_name, ref_name), 	 							# Modified name
+			ns_map.get(ref_ns, ref_ns),												# Namespace
+			type_.get("name"),  													# Type
+			m.get("minOccurs", "0") != "0" or m.get("required") is not None,  		# Required or not
+			m.get("maxOccurs", "1") != "1")  										# List or not
+	else:
+		m_ref = schema_members.get(ref_name)
+		if not m_ref:
+			if TYPE_REDIRECT.get(ref):
+				m_ref = {"name": ref_name, "type": ref}
+		if m_ref:
+			if m_ref.get("type"):
+				return (
+					MEMBER_REDIRECT.get(ref_name, ref_name),  							# Modified name
+					ns_map.get(ref_ns, ref_ns),											# Namespace
+					m_ref.get("type"),  												# Type
+					m.get("minOccurs", "0") != "0" or m.get("required") is not None,  	# Required or not
+					m.get("maxOccurs", "1") != "1")  									# List or not
+			else:
+				complex_type = m_ref.get("complexType")
+				base = replace_end(replace_end(m_ref.get("name"), "_Type", ""), "Type", "")
+				# print "...creating for reference: {base}, {name}".format(base=base, name=m_ref.get("name"))
+				complex_type["name"] = m_ref.get("name") 	# "{base}Type".format(base=base)
+				sub_complex_type = _get_data_from_complex_type(complex_type, namespace, namespaces, types, schema_members, defer)
+				if sub_complex_type:
+					# print "   ", "creating subtype for", complex_type.get("name")
+					types[sub_complex_type.get("name")] = sub_complex_type
+				return (
+					MEMBER_REDIRECT.get(m_ref.get("name"), m_ref.get("name")),  					# Modified name
+					ns_map.get(ref_ns, ref_ns),														# Namespace
+					sub_complex_type.get("parent") if sub_complex_type else m_ref.get("type"),  	# Type
+					m_ref.get("minOccurs", "0") != "0" or m_ref.get("required") is not None,  		# Required or not
+					m_ref.get("maxOccurs", "1") != "1")												# List or not
+		else:
+			print "    Deferring to create {ref} for {name}".format(ref=ref, name=type_name)
+
+def _get_from_extension(container, content_type):
+	extension 	= container.get(content_type, {}).get("extension", {})
+	parent 		= extension.get("base", "BaseSchemaType")
+	elements, attributes, __ = _get_from_type(extension)
+	return elements, attributes, parent
+
+def _get_from_content(container, content_type):
+	content = container.get(content_type, {})
+	return _get_from_type(content)
+
+def _get_from_type(container):
+	parent = container.get("restriction", {}).get("base")
+
+	attributes	= _get_items(container, "attribute")
+	# if "anyAttribute" in container:
+	# 	attributes.append({"name": "_anyAttribute", "type": "dict"})
+	elements	= _get_items(container, "element")
+
+	sequences 	= _get_items(container, "sequence")
+	choices		= _get_items(container, "choice")
+	for c in choices:
+		elements += _get_items(c, "element")
+		sequences = _get_items(c, "sequence")
+
+	for s in sequences:
+		elements += _get_items(s, "element")
+		choices = _get_items(s, "choice")
+		for c in choices:
+			elements += _get_items(c, "element")
+			sub_sequences = _get_items(c, "sequence")
+			for s_ in sub_sequences:
+				elements += _get_items(s_, "element")
+	return elements, attributes, parent
+	
+def _get_items(container, name):
+	items = container.get(name, [])
+	if not isinstance(items, list):
+		items = [items]
+	return items
+
+def get_parent_members(type_name, types, namespace):
+	members = []
+	if namespace == "xs":
+		return members
+
+	data = types[namespace].get(type_name)
+	if not data:
+		return members
+
+	parent = ""
+	if isinstance(data, dict):
+		parent = data.get("parent")
+		members += data.get("members", [])
+	elif isinstance(data, list):
+		parent = data[1]
+		members += data[4]
+
+	if ":" in parent:
+		name_parts 	= parent.split(":")
+		namespace 	= name_parts[0]
+		parent 		= name_parts[1]
+	if parent != "object" and parent != "BaseSchemaType":
+		members += get_parent_members(parent, types, namespace)
+	return members
+
+def parse_name(name, default_namespace):
+	namespace = default_namespace
+	if ":" in name:
+		parts = name.split(":")
+		name = parts[1]
+		namespace = parts[0]
+	return name, namespace
 
 def replace_end(word, search, replacement):
 	return word[::-1].replace(search[::-1], replacement[::-1], 1)[::-1]
@@ -270,228 +468,3 @@ def _get_files(path, max_depth=None, exts=None, exclude_exts=None, exclude_dirs=
 	else:
 		excluded_dirs.append(path)
 	return files, excluded_files, dirs, excluded_dirs
-def _get_data_from_simple_type(s, namespace, namespaces, types, schema_members, defer):
-	name = s.get("name")
-	print "Processing {namespace}:{name}".format(namespace=NAMESPACES.get(namespace), name=name)
-	subdata = {
-		"name": name,
-		"namespace": namespace,
-		"content_type": "",
-		"parent": s.get("restriction", {}).get("base"),
-		"abstract": s.get("abstract", False),
-		"members": []
-	}
-	return subdata
-
-def _get_data_from_complex_type(c, namespace, namespaces, types, schema_members, defer):
-	name = c.get("name")
-	print "Processing {namespace}:{name}".format(namespace=NAMESPACES.get(namespace), name=name)
-	members = []
-
-	elements, attributes, complex_parent = _get_from_extension(c, "complexContent")
-	members += elements+attributes
-
-	elements, attributes, complex_parent_2 = _get_from_content(c, "complexContent")
-	members += elements+attributes
-
-	elements, attributes, simple_parent = _get_from_extension(c, "simpleContent")
-	members += elements+attributes
-
-	elements, attributes, simple_parent_2 = _get_from_content(c, "simpleContent")
-	members += elements+attributes
-
-	elements, attributes, simple_parent_3 = _get_from_type(c)
-	members += elements+attributes
-
-	parent = "BaseSchemaType"
-	if complex_parent_2:
-		complex_parent = complex_parent_2
-
-	if simple_parent_3:
-		simple_parent = simple_parent_3
-	elif simple_parent_2:
-		simple_parent = simple_parent_2
-
-	if complex_parent == simple_parent:
-		parent = complex_parent
-	elif complex_parent == "BaseSchemaType":
-		parent = simple_parent
-	elif simple_parent == "BaseSchemaType":
-		parent = complex_parent
-
-	member_data = []
-	for m in members:
-		ref = m.get("ref")
-		datum = None
-		if m.get("name"):
-			datum = _create_from_name(m, name, namespace, namespaces, types, schema_members, defer)
-		elif ref:
-			datum = _create_from_reference(m, ref, name, namespace, namespaces, types, schema_members, defer)
-
-		if not datum:
-			defer.append(c)
-			return
-		member_data.append(datum)
-
-	appinfo = c.get("annotation", {}).get("appinfo", {})
-	if not isinstance(appinfo, list):
-		appinfo = [appinfo]
-	content_type = ""
-	for a in appinfo:
-		content_type = a.get("content-type")
-	subdata = {
-		"name": name,
-		"namespace": namespace,
-		"content_type": content_type,
-		"parent": parent,
-		"abstract": c.get("abstract", False),
-		"members": member_data
-	}
-	return subdata
-
-def _create_from_name(m, type_name, namespace, namespaces, types, schema_members, defer):
-	sub_complex_type = None
-	complex_type = m.get("complexType")
-	if complex_type:
-		base = replace_end(replace_end(type_name, "_Type", ""), "Type", "")
-		complex_type["name"] = "{base}{name}Type".format(base=base, name=m.get("name"))
-		sub_complex_type = _get_data_from_complex_type(complex_type, namespace, namespaces, types, schema_members, defer)
-		if sub_complex_type:
-			# print "   ", "creating subtype for", complex_type.get("name")
-			types[complex_type.get("name")] = sub_complex_type
-
-	return (
-		MEMBER_REDIRECT.get(m.get("name"), m.get("name")),  						# Modified name
-		NAMESPACES.get(namespace, namespace),  										# Namespace
-		sub_complex_type.get("name") if sub_complex_type else m.get("type"),  		# Type
-		m.get("minOccurs", "0") != "0" or m.get("required") is not None,  			# Required or not
-		m.get("maxOccurs", "1") != "1")  											# List or not
-
-def _create_from_reference(m, ref, type_name, namespace, namespaces, types, schema_members, defer):
-	ref_name 	= ref
-	ref_ns 		= namespace
-	if ":" in ref_name:
-		ref_ns		= ref_name.split(":")[0]
-		ref_name 	= ref_name.split(":")[1]
-
-	type_name_1 = type_name_2 = ref_name
-	if not ref_name.endswith("Type"):
-		type_name_1 = "{name}Type".format(name=ref_name)
-		type_name_2	= "{name}_Type".format(name=ref_name)
-
-	type_ = None
-	if ref_ns != namespace:
-		type_ = namespaces.get(ref_ns, {}).get(type_name_1, namespaces.get(ref_ns, {}).get(type_name_2))
-	else:
-		type_ = types.get(type_name_1, types.get(type_name_2))
-
-	if type_:
-		return (
-			MEMBER_REDIRECT.get(ref_name, ref_name), 	 							# Modified name
-			NAMESPACES.get(ref_ns, ref_ns),											# Namespace
-			type_.get("name"),  													# Type
-			m.get("minOccurs", "0") != "0" or m.get("required") is not None,  		# Required or not
-			m.get("maxOccurs", "1") != "1")  										# List or not
-	else:
-		m_ref = schema_members.get(ref_name)
-		if not m_ref:
-			if TYPE_REDIRECT.get(ref):
-				m_ref = {"name": ref_name, "type": ref}
-		if m_ref:
-			if m_ref.get("type"):
-				return (
-					MEMBER_REDIRECT.get(ref_name, ref_name),  							# Modified name
-					NAMESPACES.get(ref_ns, ref_ns),										# Namespace
-					m_ref.get("type"),  												# Type
-					m.get("minOccurs", "0") != "0" or m.get("required") is not None,  	# Required or not
-					m.get("maxOccurs", "1") != "1")  									# List or not
-			else:
-				complex_type = m_ref.get("complexType")
-				base = replace_end(replace_end(m_ref.get("name"), "_Type", ""), "Type", "")
-				# print "...creating for reference: {base}, {name}".format(base=base, name=m_ref.get("name"))
-				complex_type["name"] = m_ref.get("name") 	# "{base}Type".format(base=base)
-				sub_complex_type = _get_data_from_complex_type(complex_type, namespace, namespaces, types, schema_members, defer)
-				if sub_complex_type:
-					# print "   ", "creating subtype for", complex_type.get("name")
-					types[sub_complex_type.get("name")] = sub_complex_type
-				return (
-					MEMBER_REDIRECT.get(m_ref.get("name"), m_ref.get("name")),  					# Modified name
-					NAMESPACES.get(ref_ns, ref_ns),													# Namespace
-					sub_complex_type.get("parent") if sub_complex_type else m_ref.get("type"),  	# Type
-					m_ref.get("minOccurs", "0") != "0" or m_ref.get("required") is not None,  		# Required or not
-					m_ref.get("maxOccurs", "1") != "1")												# List or not
-		else:
-			print "    Deferring to create {ref} for {name}".format(ref=ref, name=type_name)
-
-def _get_from_extension(container, content_type):
-	extension 	= container.get(content_type, {}).get("extension", {})
-	parent 		= extension.get("base", "BaseSchemaType")
-	elements, attributes, __ = _get_from_type(extension)
-	return elements, attributes, parent
-
-def _get_from_content(container, content_type):
-	content = container.get(content_type, {})
-	return _get_from_type(content)
-
-def _get_from_type(container):
-	parent = container.get("restriction", {}).get("base")
-
-	attributes	= _get_items(container, "attribute")
-	# if "anyAttribute" in container:
-	# 	attributes.append({"name": "_anyAttribute", "type": "dict"})
-	elements	= _get_items(container, "element")
-
-	sequences 	= _get_items(container, "sequence")
-	choices		= _get_items(container, "choice")
-	for c in choices:
-		elements += _get_items(c, "element")
-		sequences = _get_items(c, "sequence")
-
-	for s in sequences:
-		elements += _get_items(s, "element")
-		choices = _get_items(s, "choice")
-		for c in choices:
-			elements += _get_items(c, "element")
-			sub_sequences = _get_items(c, "sequence")
-			for s_ in sub_sequences:
-				elements += _get_items(s_, "element")
-	return elements, attributes, parent
-
-def _get_items(container, name):
-	items = container.get(name, [])
-	if not isinstance(items, list):
-		items = [items]
-	return items
-
-def get_parent_members(type_name, types, namespace):
-	members = []
-	if namespace == "xs":
-		return members
-
-	data = types[namespace].get(type_name)
-	if not data:
-		return members
-
-	parent = ""
-	if isinstance(data, dict):
-		parent = data.get("parent")
-		members += data.get("members", [])
-	elif isinstance(data, list):
-		parent = data[1]
-		members += data[4]
-
-	if ":" in parent:
-		name_parts 	= parent.split(":")
-		namespace 	= name_parts[0]
-		parent 		= name_parts[1]
-	if parent != "object" and parent != "BaseSchemaType":
-		members += get_parent_members(parent, types, namespace)
-	return members
-
-def parse_name(name, default_namespace):
-	namespace = default_namespace
-	if ":" in name:
-		parts = name.split(":")
-		name = parts[1]
-		namespace = parts[0]
-	return name, namespace
